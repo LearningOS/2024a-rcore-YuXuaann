@@ -63,6 +63,7 @@ impl MemorySet {
             None,
         );
     }
+    /// Push a new area into the memory set.
     fn push(&mut self, mut map_area: MapArea, data: Option<&[u8]>) {
         map_area.map(&mut self.page_table);
         if let Some(data) = data {
@@ -262,6 +263,56 @@ impl MemorySet {
             false
         }
     }
+
+    /// mmap system call
+    pub fn mmap(&mut self, start: usize, len: usize, prot: MapPermission) -> isize {
+        let start_va = VirtAddr::from(start);
+        let end_va = VirtAddr::from(start + len);
+        // remeber to floor and ceil!
+        let start_va_vpn = start_va.floor();
+        let end_va_vpn = end_va.ceil();
+
+        // [start, start + len) 中存在已经被映射的页
+        for map_area in &self.areas {
+            if map_area.get_start_vpn() <= start_va_vpn && start_va_vpn < map_area.get_end_vpn() {
+                return -1;
+            }
+            if map_area.get_start_vpn() < end_va_vpn && end_va_vpn <= map_area.get_end_vpn() {
+                return -1;
+            }
+        }
+
+        self.insert_framed_area(start_va, end_va, prot);
+        0
+    }
+
+    /// unmap part of virtual page number
+    pub fn unmap(&mut self, start: usize, len: usize) -> isize {
+        let start_va = VirtAddr::from(start);
+        let end_va = VirtAddr::from(start + len);
+
+        // 没有按页大小对齐
+        if !start_va.aligned() || !end_va.aligned() {
+            return -1;
+        }
+
+        // remeber to floor and ceil!
+        let start_va_vpn = start_va.floor();
+        let end_va_vpn = end_va.ceil();
+
+        let mut removed_index = 0;
+        for (i, area) in self.areas.iter_mut().enumerate() {
+            if area.get_start_vpn() <= start_va_vpn && end_va_vpn <= area.get_end_vpn() {
+                area.unmap(&mut self.page_table);
+                removed_index = i;
+            }
+        }
+
+        if removed_index != 0 {
+            self.areas.remove(removed_index);
+        }
+        0
+    }
 }
 /// map area structure, controls a contiguous piece of virtual memory
 pub struct MapArea {
@@ -272,6 +323,7 @@ pub struct MapArea {
 }
 
 impl MapArea {
+    /// Create a new `MapArea`.
     pub fn new(
         start_va: VirtAddr,
         end_va: VirtAddr,
@@ -287,6 +339,7 @@ impl MapArea {
             map_perm,
         }
     }
+    /// map one virtual page number to a physical page number
     pub fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
         let ppn: PhysPageNum;
         match self.map_type {
@@ -303,24 +356,28 @@ impl MapArea {
         page_table.map(vpn, ppn, pte_flags);
     }
     #[allow(unused)]
+    /// unmap one virtual page number
     pub fn unmap_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
         if self.map_type == MapType::Framed {
             self.data_frames.remove(&vpn);
         }
         page_table.unmap(vpn);
     }
+    /// map all virtual page numbers
     pub fn map(&mut self, page_table: &mut PageTable) {
         for vpn in self.vpn_range {
             self.map_one(page_table, vpn);
         }
     }
     #[allow(unused)]
+    /// unmap all virtual page numbers
     pub fn unmap(&mut self, page_table: &mut PageTable) {
         for vpn in self.vpn_range {
             self.unmap_one(page_table, vpn);
         }
     }
     #[allow(unused)]
+    /// shrink the area to new_end
     pub fn shrink_to(&mut self, page_table: &mut PageTable, new_end: VirtPageNum) {
         for vpn in VPNRange::new(new_end, self.vpn_range.get_end()) {
             self.unmap_one(page_table, vpn)
@@ -328,6 +385,7 @@ impl MapArea {
         self.vpn_range = VPNRange::new(self.vpn_range.get_start(), new_end);
     }
     #[allow(unused)]
+    /// append the area to new_end
     pub fn append_to(&mut self, page_table: &mut PageTable, new_end: VirtPageNum) {
         for vpn in VPNRange::new(self.vpn_range.get_end(), new_end) {
             self.map_one(page_table, vpn)
@@ -356,12 +414,24 @@ impl MapArea {
             current_vpn.step();
         }
     }
+
+    /// get start virtual addr
+    pub fn get_start_vpn(&self) -> VirtPageNum {
+        self.vpn_range.get_start()
+    }
+
+    /// get end virtual addr
+    pub fn get_end_vpn(&self) -> VirtPageNum {
+        self.vpn_range.get_end()
+    }
 }
 
 #[derive(Copy, Clone, PartialEq, Debug)]
 /// map type for memory set: identical or framed
 pub enum MapType {
+    /// identical mapping
     Identical,
+    /// framed mapping
     Framed,
 }
 

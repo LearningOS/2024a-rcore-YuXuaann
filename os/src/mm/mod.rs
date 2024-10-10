@@ -9,7 +9,7 @@
 mod address;
 mod frame_allocator;
 mod heap_allocator;
-mod memory_set;
+pub mod memory_set;
 mod page_table;
 
 pub use address::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
