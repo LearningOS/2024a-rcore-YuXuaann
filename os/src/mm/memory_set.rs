@@ -300,6 +300,56 @@ impl MemorySet {
             false
         }
     }
+
+    /// mmap system call
+    pub fn mmap(&mut self, start: usize, len: usize, prot: MapPermission) -> isize {
+        let start_va = VirtAddr::from(start);
+        let end_va = VirtAddr::from(start + len);
+        // remeber to floor and ceil!
+        let start_va_vpn = start_va.floor();
+        let end_va_vpn = end_va.ceil();
+
+        // [start, start + len) 中存在已经被映射的页
+        for map_area in &self.areas {
+            if map_area.get_start_vpn() <= start_va_vpn && start_va_vpn < map_area.get_end_vpn() {
+                return -1;
+            }
+            if map_area.get_start_vpn() < end_va_vpn && end_va_vpn <= map_area.get_end_vpn() {
+                return -1;
+            }
+        }
+
+        self.insert_framed_area(start_va, end_va, prot);
+        0
+    }
+
+    /// unmap part of virtual page number
+    pub fn unmap(&mut self, start: usize, len: usize) -> isize {
+        let start_va = VirtAddr::from(start);
+        let end_va = VirtAddr::from(start + len);
+
+        // 没有按页大小对齐
+        if !start_va.aligned() || !end_va.aligned() {
+            return -1;
+        }
+
+        // remeber to floor and ceil!
+        let start_va_vpn = start_va.floor();
+        let end_va_vpn = end_va.ceil();
+
+        let mut removed_index = 0;
+        for (i, area) in self.areas.iter_mut().enumerate() {
+            if area.get_start_vpn() <= start_va_vpn && end_va_vpn <= area.get_end_vpn() {
+                area.unmap(&mut self.page_table);
+                removed_index = i;
+            }
+        }
+
+        if removed_index != 0 {
+            self.areas.remove(removed_index);
+        }
+        0
+    }
 }
 /// map area structure, controls a contiguous piece of virtual memory
 pub struct MapArea {
@@ -399,6 +449,16 @@ impl MapArea {
             }
             current_vpn.step();
         }
+    }
+
+    /// get start virtual addr
+    pub fn get_start_vpn(&self) -> VirtPageNum {
+        self.vpn_range.get_start()
+    }
+
+    /// get end virtual addr
+    pub fn get_end_vpn(&self) -> VirtPageNum {
+        self.vpn_range.get_end()
     }
 }
 

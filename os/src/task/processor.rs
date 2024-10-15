@@ -7,7 +7,9 @@
 use super::__switch;
 use super::{fetch_task, TaskStatus};
 use super::{TaskContext, TaskControlBlock};
+use crate::mm::translated_byte_buffer;
 use crate::sync::UPSafeCell;
+use crate::timer::get_time_us;
 use crate::trap::TrapContext;
 use alloc::sync::Arc;
 use lazy_static::*;
@@ -56,11 +58,21 @@ pub fn run_tasks() {
     loop {
         let mut processor = PROCESSOR.exclusive_access();
         if let Some(task) = fetch_task() {
+            // if task.inner_exclusive_access().stride % 101 == 0 {
+            //     println!(
+            //         "[debug] run_tasks: stride: {}",
+            //         task.inner_exclusive_access().stride
+            //     );
+            // }
+
             let idle_task_cx_ptr = processor.get_idle_task_cx_ptr();
             // access coming task TCB exclusively
             let mut task_inner = task.inner_exclusive_access();
             let next_task_cx_ptr = &task_inner.task_cx as *const TaskContext;
             task_inner.task_status = TaskStatus::Running;
+            if task_inner.start_time != 0 {
+                task_inner.start_time = get_time_us();
+            }
             // release coming task_inner manually
             drop(task_inner);
             // release coming task TCB manually
@@ -90,6 +102,26 @@ pub fn current_task() -> Option<Arc<TaskControlBlock>> {
 pub fn current_user_token() -> usize {
     let task = current_task().unwrap();
     task.get_user_token()
+}
+
+/// Write to the current user addr space
+/// TODO: has bug!
+pub fn write_to_current_user_buffer<T, F>(addr: T, data: F, len: usize) -> isize
+where
+    T: Into<*const u8>,
+    F: Into<*const u8>,
+{
+    let token = current_user_token();
+    let data_ptr = data.into();
+    let addr_ptr = addr.into();
+    let buffer = translated_byte_buffer(token, addr_ptr, len);
+    if buffer.is_empty() {
+        return -1;
+    }
+    buffer.into_iter().enumerate().for_each(|(_, byte)| unsafe {
+        core::ptr::copy(data_ptr, byte.as_mut_ptr(), len);
+    });
+    0
 }
 
 ///Get the mutable reference to trap context of current task

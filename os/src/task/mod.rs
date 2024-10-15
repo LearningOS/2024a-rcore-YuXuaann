@@ -21,7 +21,13 @@ mod switch;
 #[allow(clippy::module_inception)]
 mod task;
 
-use crate::loader::get_app_data_by_name;
+use crate::{
+    config::{MAX_SYSCALL_NUM, PAGE_SIZE},
+    loader::get_app_data_by_name,
+    mm::MapPermission,
+    syscall::TaskInfo,
+    timer::get_time_us,
+};
 use alloc::sync::Arc;
 use lazy_static::*;
 pub use manager::{fetch_task, TaskManager};
@@ -33,7 +39,7 @@ pub use id::{kstack_alloc, pid_alloc, KernelStack, PidHandle};
 pub use manager::add_task;
 pub use processor::{
     current_task, current_trap_cx, current_user_token, run_tasks, schedule, take_current_task,
-    Processor,
+    write_to_current_user_buffer, Processor,
 };
 /// Suspend the current 'Running' task and run the next task in task list.
 pub fn suspend_current_and_run_next() {
@@ -114,4 +120,88 @@ lazy_static! {
 ///Add init process to the manager
 pub fn add_initproc() {
     add_task(INITPROC.clone());
+}
+
+/// Update syscall times
+pub fn count_syscall_times(syscall_id: usize) {
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    inner.syscall_times[syscall_id] += 1;
+}
+
+/// Get status of current task
+pub fn get_current_task_status() -> TaskStatus {
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
+    inner.get_status()
+}
+
+/// Get syscall_times of current task
+pub fn get_current_task_syscall_times() -> [u32; MAX_SYSCALL_NUM] {
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
+    inner.syscall_times
+}
+
+/// Get start_time of current task
+pub fn get_current_task_start_time() -> usize {
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
+    inner.start_time
+}
+
+/// Get current task info
+pub fn get_current_task_info() -> TaskInfo {
+    let running_time = get_time_us() - get_current_task_start_time();
+    TaskInfo {
+        status: get_current_task_status(),
+        syscall_times: get_current_task_syscall_times(),
+        time: running_time / 1000,
+    }
+}
+
+/// Add mmap to the current task
+pub fn current_task_mmap(_start: usize, _len: usize, _port: usize) -> isize {
+    // start 没有按页大小对齐
+    if _start % PAGE_SIZE != 0 {
+        return -1;
+    }
+    // port & !0x7 != 0 (port 其余位必须为0)
+    if _port & !0x7 != 0 {
+        return -1;
+    }
+    // port & 0x7 = 0
+    if _port & 0x7 == 0 {
+        return -1;
+    }
+
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    let mut map_perm = MapPermission::empty();
+
+    if _port & (1 << 0) != 0 {
+        map_perm |= MapPermission::R;
+    }
+    if _port & (1 << 1) != 0 {
+        map_perm |= MapPermission::W;
+    }
+    if _port & (1 << 2) != 0 {
+        map_perm |= MapPermission::X;
+    }
+    // don't forget to add user permission
+    map_perm |= MapPermission::U;
+
+    inner.memory_set.mmap(_start, _len, map_perm)
+}
+
+/// Unmmap to the current task
+pub fn current_task_munmap(_start: usize, _len: usize) -> isize {
+    // start 没有按页大小对齐
+    if _start % PAGE_SIZE != 0 {
+        return -1;
+    }
+
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    inner.memory_set.unmap(_start, _len)
 }
