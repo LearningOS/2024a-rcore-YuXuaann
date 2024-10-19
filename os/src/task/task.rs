@@ -1,7 +1,7 @@
 //! Types related to task management & Functions for completely changing TCB
 use super::TaskContext;
 use super::{kstack_alloc, pid_alloc, KernelStack, PidHandle};
-use crate::config::TRAP_CONTEXT_BASE;
+use crate::config::{MAX_SYSCALL_NUM, TRAP_CONTEXT_BASE};
 use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE};
 use crate::sync::UPSafeCell;
@@ -10,6 +10,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefMut;
+use core::cmp::Ordering;
 
 /// Task control block structure
 ///
@@ -35,6 +36,34 @@ impl TaskControlBlock {
     pub fn get_user_token(&self) -> usize {
         let inner = self.inner_exclusive_access();
         inner.memory_set.token()
+    }
+}
+
+impl PartialEq for TaskControlBlock {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner_exclusive_access().stride == other.inner_exclusive_access().stride
+    }
+}
+
+impl Eq for TaskControlBlock {}
+
+impl PartialOrd for TaskControlBlock {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(
+            other
+                .inner_exclusive_access()
+                .stride
+                .cmp(&self.inner_exclusive_access().stride),
+        )
+    }
+}
+
+impl Ord for TaskControlBlock {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .inner_exclusive_access()
+            .stride
+            .cmp(&self.inner_exclusive_access().stride)
     }
 }
 
@@ -71,6 +100,18 @@ pub struct TaskControlBlockInner {
 
     /// Program break
     pub program_brk: usize,
+
+    /// Syscall times
+    pub syscall_times: [u32; MAX_SYSCALL_NUM],
+
+    /// Start time
+    pub start_time: usize,
+
+    /// Priority
+    pub priority: isize,
+
+    /// Stride
+    pub stride: isize,
 }
 
 impl TaskControlBlockInner {
@@ -80,11 +121,23 @@ impl TaskControlBlockInner {
     pub fn get_user_token(&self) -> usize {
         self.memory_set.token()
     }
-    fn get_status(&self) -> TaskStatus {
+    pub fn get_status(&self) -> TaskStatus {
         self.task_status
     }
     pub fn is_zombie(&self) -> bool {
         self.get_status() == TaskStatus::Zombie
+    }
+    /// get the pass
+    pub fn get_pass(&self) -> isize {
+        255 as isize / self.priority
+    }
+    /// set the priority
+    pub fn set_priority(&mut self, priority: isize) {
+        self.priority = priority;
+    }
+    /// update the stride
+    pub fn update_stride(&mut self) {
+        self.stride += self.get_pass()
     }
     pub fn alloc_fd(&mut self) -> usize {
         if let Some(fd) = (0..self.fd_table.len()).find(|fd| self.fd_table[*fd].is_none()) {
@@ -135,6 +188,10 @@ impl TaskControlBlock {
                     ],
                     heap_bottom: user_sp,
                     program_brk: user_sp,
+                    syscall_times: [0; MAX_SYSCALL_NUM],
+                    start_time: 0,
+                    priority: 16,
+                    stride: 0,
                 })
             },
         };
@@ -216,6 +273,10 @@ impl TaskControlBlock {
                     fd_table: new_fd_table,
                     heap_bottom: parent_inner.heap_bottom,
                     program_brk: parent_inner.program_brk,
+                    syscall_times: [0; MAX_SYSCALL_NUM],
+                    start_time: 0,
+                    priority: 16,
+                    stride: 0,
                 })
             },
         });

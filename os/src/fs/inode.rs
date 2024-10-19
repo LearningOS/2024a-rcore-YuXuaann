@@ -4,12 +4,12 @@
 //!
 //! `UPSafeCell<OSInodeInner>` -> `OSInode`: for static `ROOT_INODE`,we
 //! need to wrap `OSInodeInner` into `UPSafeCell`
-use super::File;
+use super::{File, StatMode};
 use crate::drivers::BLOCK_DEVICE;
 use crate::mm::UserBuffer;
 use crate::sync::UPSafeCell;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
+use alloc::{collections::btree_map::BTreeMap, sync::Arc};
 use bitflags::*;
 use easy_fs::{EasyFileSystem, Inode};
 use lazy_static::*;
@@ -59,6 +59,8 @@ lazy_static! {
         let efs = EasyFileSystem::open(BLOCK_DEVICE.clone());
         Arc::new(EasyFileSystem::root_inode(&efs))
     };
+    pub static ref HARD_LINK_COUNT: UPSafeCell<BTreeMap<usize, u32>> =
+        unsafe { UPSafeCell::new(BTreeMap::new()) };
 }
 
 /// List all apps in the root directory
@@ -110,6 +112,7 @@ pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
             Some(Arc::new(OSInode::new(readable, writable, inode)))
         } else {
             // create file
+            println!("[open_file] create file: {}", name);
             ROOT_INODE
                 .create(name)
                 .map(|inode| Arc::new(OSInode::new(readable, writable, inode)))
@@ -122,6 +125,56 @@ pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
             Arc::new(OSInode::new(readable, writable, inode))
         })
     }
+}
+
+/// Find app's inode
+pub fn find_inode(name: &str) -> Option<Arc<Inode>> {
+    ROOT_INODE.find(name)
+}
+
+/// Link
+pub fn link(new_name: &str, old_inode_id: u32) {
+    ROOT_INODE.hard_link(
+        new_name,
+        old_inode_id,
+        &mut HARD_LINK_COUNT.exclusive_access(),
+    );
+}
+
+/// Unlink
+pub fn unlink(name: &str) {
+    ROOT_INODE.unlink(name, &mut HARD_LINK_COUNT.exclusive_access());
+}
+
+/// debug for hard_link
+pub fn show_hard_link() {
+    println!("/**** HARD LINK ****");
+    HARD_LINK_COUNT
+        .exclusive_access()
+        .iter()
+        .for_each(|(k, v)| {
+            println!("inode_id: {}, count: {}", k, v);
+        });
+    println!("**************/");
+}
+
+/// debug for root_inode
+pub fn show_inode_under_root() {
+    println!("/**** ROOT INODE ****");
+    for inode in ROOT_INODE.ls() {
+        println!("{}", inode);
+    }
+    println!("**************/");
+}
+
+/// get hard link count
+pub fn nlink(inode_id: usize) -> u32 {
+    println!("[sys_stat] nlink: {}", inode_id);
+    HARD_LINK_COUNT
+        .exclusive_access()
+        .get(&inode_id)
+        .copied()
+        .unwrap_or(1)
 }
 
 impl File for OSInode {
@@ -154,5 +207,17 @@ impl File for OSInode {
             total_write_size += write_size;
         }
         total_write_size
+    }
+    fn inode_id(&self) -> usize {
+        self.inner.exclusive_access().inode.inode_id() as usize
+    }
+    fn mode(&self) -> StatMode {
+        if self.inner.exclusive_access().inode.is_dir() {
+            StatMode::DIR
+        } else if self.inner.exclusive_access().inode.is_file() {
+            StatMode::FILE
+        } else {
+            StatMode::NULL
+        }
     }
 }

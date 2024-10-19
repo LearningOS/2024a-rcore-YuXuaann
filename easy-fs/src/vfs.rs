@@ -2,9 +2,9 @@ use super::{
     block_cache_sync_all, get_block_cache, BlockDevice, DirEntry, DiskInode, DiskInodeType,
     EasyFileSystem, DIRENT_SZ,
 };
-use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use alloc::{collections::btree_map::BTreeMap, string::String};
 use spin::{Mutex, MutexGuard};
 /// Virtual filesystem layer over easy-fs
 pub struct Inode {
@@ -62,16 +62,34 @@ impl Inode {
     pub fn find(&self, name: &str) -> Option<Arc<Inode>> {
         let fs = self.fs.lock();
         self.read_disk_inode(|disk_inode| {
-            self.find_inode_id(name, disk_inode).map(|inode_id| {
-                let (block_id, block_offset) = fs.get_disk_inode_pos(inode_id);
-                Arc::new(Self::new(
-                    block_id,
-                    block_offset,
-                    self.fs.clone(),
-                    self.block_device.clone(),
-                ))
-            })
+            let inode_id = self.find_inode_id(name, disk_inode);
+            if inode_id.is_none() {
+                return None;
+            }
+            if inode_id.unwrap() == u32::MAX {
+                return None;
+            }
+            let (block_id, block_offset) = fs.get_disk_inode_pos(inode_id.unwrap());
+            Some(Arc::new(Self::new(
+                block_id,
+                block_offset,
+                self.fs.clone(),
+                self.block_device.clone(),
+            )))
         })
+    }
+    /// Get inode id
+    pub fn inode_id(&self) -> u32 {
+        let fs = self.fs.lock();
+        fs.get_inode_id(self.block_id, self.block_offset)
+    }
+    /// Check if is dir
+    pub fn is_dir(&self) -> bool {
+        self.read_disk_inode(|disk_inode| disk_inode.is_dir())
+    }
+    /// Check if is file
+    pub fn is_file(&self) -> bool {
+        self.read_disk_inode(|disk_inode| disk_inode.is_file())
     }
     /// Increase the size of a disk inode
     fn increase_size(
@@ -138,6 +156,57 @@ impl Inode {
         )))
         // release efs lock automatically by compiler
     }
+
+    /// Create hard link new -> old
+    pub fn hard_link(&self, new_name: &str, old_inode_id: u32, count: &mut BTreeMap<usize, u32>) {
+        let mut fs = self.fs.lock();
+        self.modify_disk_inode(|root_inode| {
+            // append file in the dirent
+            let file_count = (root_inode.size as usize) / DIRENT_SZ;
+            let new_size = (file_count + 1) * DIRENT_SZ;
+            // increase size
+            self.increase_size(new_size as u32, root_inode, &mut fs);
+            // write dirent
+            let dirent = DirEntry::new(new_name, old_inode_id);
+            root_inode.write_at(
+                file_count * DIRENT_SZ,
+                dirent.as_bytes(),
+                &self.block_device,
+            );
+        });
+        let _ = *count
+            .entry(old_inode_id as usize)
+            .and_modify(|x| *x += 1)
+            .or_insert(2);
+        block_cache_sync_all();
+    }
+
+    /// Unlink under to new_inode
+    pub fn unlink(&self, name: &str, count: &mut BTreeMap<usize, u32>) {
+        let _fs = self.fs.lock();
+        self.modify_disk_inode(|disk_inode| {
+            let file_count = (disk_inode.size as usize) / DIRENT_SZ;
+            for i in 0..file_count {
+                let mut dirent = DirEntry::empty();
+                assert_eq!(
+                    disk_inode.read_at(i * DIRENT_SZ, dirent.as_bytes_mut(), &self.block_device,),
+                    DIRENT_SZ,
+                );
+                if dirent.name() == name {
+                    let new_dirent = DirEntry::new("", u32::MAX);
+                    disk_inode.write_at(i * DIRENT_SZ, new_dirent.as_bytes(), &self.block_device);
+                    let _ = *count
+                        .entry(dirent.inode_id() as usize)
+                        .and_modify(|x: &mut u32| *x -= 1)
+                        .or_insert(0);
+                    break;
+                }
+            }
+        });
+
+        block_cache_sync_all();
+    }
+
     /// List inodes under current inode
     pub fn ls(&self) -> Vec<String> {
         let _fs = self.fs.lock();
