@@ -127,6 +127,7 @@ impl File for Pipe {
                 if ring_buffer.all_write_ends_closed() {
                     return already_read;
                 }
+                // 因为__switch不同于正常的函数调用，故需要手动释放锁
                 drop(ring_buffer);
                 suspend_current_and_run_next();
                 continue;

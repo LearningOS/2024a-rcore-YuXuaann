@@ -1,6 +1,8 @@
 //! Types related to task management & Functions for completely changing TCB
 
-use super::{kstack_alloc, pid_alloc, KernelStack, PidHandle, SignalActions, SignalFlags, TaskContext};
+use super::{
+    kstack_alloc, pid_alloc, KernelStack, PidHandle, SignalActions, SignalFlags, TaskContext,
+};
 use crate::{
     config::TRAP_CONTEXT_BASE,
     fs::{File, Stdin, Stdout},
@@ -182,6 +184,7 @@ impl TaskControlBlock {
             .unwrap()
             .ppn();
         // push arguments on user stack
+        // 分配一个字符串指针数组区域。数组中的每个元素都指向一个用户栈更低处的命令行参数字符串的起始地址
         user_sp -= (args.len() + 1) * core::mem::size_of::<usize>();
         let argv_base = user_sp;
         let mut argv: Vec<_> = (0..=args.len())
@@ -192,8 +195,11 @@ impl TaskControlBlock {
                 )
             })
             .collect();
+        // 保证字符串指针数组的最后一项是0，代表末尾
         *argv[args.len()] = 0;
+        // 继续分配具体的字符串，紧接着刚才的字符串指针数组，并且更新该数组
         for i in 0..args.len() {
+            // +1 的原因是字符串末尾需要有 \0
             user_sp -= args[i].len() + 1;
             *argv[i] = user_sp;
             let mut p = user_sp;
@@ -201,6 +207,8 @@ impl TaskControlBlock {
                 *translated_refmut(memory_set.token(), p as *mut u8) = *c;
                 p += 1;
             }
+            // 给字符串添加 \0
+            // 因为 translated_str 从应用地址空间取出的，它的末尾不包含 \0
             *translated_refmut(memory_set.token(), p as *mut u8) = 0;
         }
         // make the user_sp aligned to 8B for k210 platform
