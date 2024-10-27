@@ -7,6 +7,7 @@
 use super::__switch;
 use super::{fetch_task, TaskStatus};
 use super::{ProcessControlBlock, TaskContext, TaskControlBlock};
+use crate::mm::translated_byte_buffer;
 use crate::sync::UPSafeCell;
 use crate::trap::TrapContext;
 use alloc::sync::Arc;
@@ -93,6 +94,26 @@ pub fn current_process() -> Arc<ProcessControlBlock> {
 pub fn current_user_token() -> usize {
     let task = current_task().unwrap();
     task.get_user_token()
+}
+
+/// Write to the current user addr space
+/// no bug
+pub fn write_to_current_user_buffer<T, F>(addr: T, data: F, len: usize) -> isize
+where
+    T: Into<*const u8>,
+    F: Into<*const u8>,
+{
+    let token = current_user_token();
+    let data_ptr = data.into();
+    let addr_ptr = addr.into();
+    let buffer = translated_byte_buffer(token, addr_ptr, len);
+    if buffer.is_empty() {
+        return -1;
+    }
+    buffer.into_iter().enumerate().for_each(|(_, byte)| unsafe {
+        core::ptr::copy(data_ptr, byte.as_mut_ptr(), len);
+    });
+    0
 }
 
 /// Get the mutable reference to trap context of current task

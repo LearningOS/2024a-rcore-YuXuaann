@@ -1,6 +1,6 @@
 use crate::{
     mm::kernel_token,
-    task::{add_task, current_task, TaskControlBlock},
+    task::{add_task, current_task, BankerType, TaskControlBlock},
     trap::{trap_handler, TrapContext},
 };
 use alloc::sync::Arc;
@@ -50,6 +50,13 @@ pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
         trap_handler as usize,
     );
     (*new_task_trap_cx).x[10] = arg;
+
+    drop(new_task_inner);
+    drop(new_task);
+
+    process_inner.thread_deadlock_list_extend(usize::MAX, BankerType::Sem);
+    process_inner.thread_deadlock_list_extend(usize::MAX, BankerType::Mutex);
+
     new_task_tid as isize
 }
 /// get current thread id syscall

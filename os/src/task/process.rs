@@ -2,6 +2,7 @@
 
 use super::id::RecycleAllocator;
 use super::manager::insert_into_pid2process;
+use super::task::BankerType;
 use super::TaskControlBlock;
 use super::{add_task, SignalFlags};
 use super::{pid_alloc, PidHandle};
@@ -27,6 +28,8 @@ pub struct ProcessControlBlock {
 pub struct ProcessControlBlockInner {
     /// is zombie?
     pub is_zombie: bool,
+    /// deadlock detect
+    pub deadlock_detect: bool,
     /// memory set(address space)
     pub memory_set: MemorySet,
     /// parent process
@@ -49,6 +52,8 @@ pub struct ProcessControlBlockInner {
     pub semaphore_list: Vec<Option<Arc<Semaphore>>>,
     /// condvar list
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
+    /// available list
+    pub available_list: Vec<usize>,
 }
 
 impl ProcessControlBlockInner {
@@ -82,6 +87,133 @@ impl ProcessControlBlockInner {
     pub fn get_task(&self, tid: usize) -> Arc<TaskControlBlock> {
         self.tasks[tid].as_ref().unwrap().clone()
     }
+    /// set deadlock_detect
+    pub fn set_deadlock_detect(&mut self, value: bool) {
+        self.deadlock_detect = value;
+    }
+    /// get deadlock_detect
+    pub fn get_deadlock_detect(&self) -> bool {
+        self.deadlock_detect
+    }
+    /// extend deadlock banker lists
+    pub fn thread_deadlock_list_extend(&self, len: usize, type_: BankerType) {
+        trace!(
+            "kernel: pid{}, extend_deadlock_list, len: {}, type: {:?}",
+            self.parent.as_ref().unwrap().upgrade().unwrap().pid.0,
+            len,
+            type_
+        );
+        let length = if len == usize::MAX {
+            self.available_list.len()
+        } else {
+            len
+        };
+        for task in self.tasks.iter() {
+            if let Some(task) = task.as_ref() {
+                task.inner_exclusive_access().extend_list(length, type_);
+            }
+        }
+    }
+    /// deallocate resource
+    pub fn dealloc_res(&mut self, tid: usize, res_id: usize, type_: BankerType) {
+        self.tasks[tid]
+            .as_ref()
+            .unwrap()
+            .inner_exclusive_access()
+            .dealloc_res(res_id, type_);
+        self.available_list[res_id] += 1;
+    }
+    /// deadlock detect, request resource is equal to 1
+    pub fn alloc_res(
+        &mut self,
+        tid: usize,
+        res_id: usize,
+        _req_res: usize,
+        type_: BankerType,
+    ) -> bool {
+        match type_ {
+            BankerType::Mutex => {
+                assert_eq!(self.available_list.len(), self.mutex_list.len());
+            }
+            BankerType::Sem => {
+                assert_eq!(self.available_list.len(), self.semaphore_list.len());
+            }
+        }
+
+        if !self.get_deadlock_detect() {
+            return true;
+        }
+        let available_list = self.available_list.clone();
+        // req_res == 1
+        if available_list[res_id] < 1 {
+            self.tasks[tid]
+                .as_ref()
+                .unwrap()
+                .inner_exclusive_access()
+                .get_need_list(type_)[res_id] = 1;
+            return false;
+        }
+
+        let mut tasks = Vec::new();
+        for i in 0..self.tasks.len() {
+            if let Some(task) = &self.tasks[i] {
+                tasks.push(task);
+            }
+        }
+        let res_len = available_list.len();
+        let thr_len = tasks.len();
+        let mut work = available_list.clone();
+        let mut finish = vec![false; thr_len];
+
+        loop {
+            let mut chosen = thr_len;
+            for thr_id in 0..thr_len {
+                if finish[thr_id] {
+                    continue;
+                }
+                let mut found = true;
+                for res_id in 0..res_len {
+                    let need = self.tasks[thr_id]
+                        .as_ref()
+                        .unwrap()
+                        .inner_exclusive_access()
+                        .get_need_list(type_)[res_id];
+                    if need > work[res_id] {
+                        found = false;
+                        break;
+                    }
+                }
+                if found {
+                    chosen = thr_id;
+                    break;
+                }
+            }
+            if chosen == thr_len {
+                break;
+            }
+            finish[chosen] = true;
+            for res_id in 0..res_len {
+                let allocated = self.tasks[chosen]
+                    .as_ref()
+                    .unwrap()
+                    .inner_exclusive_access()
+                    .get_allocated_list(type_)[res_id];
+                work[res_id] += allocated;
+            }
+        }
+
+        let alloc_succeed = finish.iter().all(|&f| f);
+        if alloc_succeed {
+            self.tasks[tid]
+                .as_ref()
+                .unwrap()
+                .inner_exclusive_access()
+                .alloc(res_id, type_);
+            self.available_list[res_id] -= 1;
+        }
+
+        alloc_succeed
+    }
 }
 
 impl ProcessControlBlock {
@@ -101,6 +233,7 @@ impl ProcessControlBlock {
             inner: unsafe {
                 UPSafeCell::new(ProcessControlBlockInner {
                     is_zombie: false,
+                    deadlock_detect: false,
                     memory_set,
                     parent: None,
                     children: Vec::new(),
@@ -119,6 +252,7 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    available_list: Vec::new(),
                 })
             },
         });
@@ -234,6 +368,7 @@ impl ProcessControlBlock {
             inner: unsafe {
                 UPSafeCell::new(ProcessControlBlockInner {
                     is_zombie: false,
+                    deadlock_detect: false,
                     memory_set,
                     parent: Some(Arc::downgrade(self)),
                     children: Vec::new(),
@@ -245,6 +380,7 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    available_list: Vec::new(),
                 })
             },
         });
