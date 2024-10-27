@@ -1,5 +1,5 @@
 use crate::sync::{Condvar, Mutex, MutexBlocking, MutexSpin, Semaphore};
-use crate::task::{block_current_and_run_next, current_process, current_task, BankerType};
+use crate::task::{block_current_and_run_next, current_process, current_task};
 use crate::timer::{add_timer, get_time_ms};
 use alloc::sync::Arc;
 /// sleep syscall
@@ -41,7 +41,7 @@ pub fn sys_mutex_create(blocking: bool) -> isize {
         Some(Arc::new(MutexBlocking::new()))
     };
     let mut process_inner = process.inner_exclusive_access();
-    if let Some(id) = process_inner
+    let res_id = if let Some(id) = process_inner
         .mutex_list
         .iter()
         .enumerate()
@@ -49,24 +49,13 @@ pub fn sys_mutex_create(blocking: bool) -> isize {
         .map(|(id, _)| id)
     {
         process_inner.mutex_list[id] = mutex;
-        process_inner.available_list[id] = 1;
-        assert_eq!(
-            process_inner.mutex_list.len(),
-            process_inner.available_list.len()
-        );
-        process_inner.thread_deadlock_list_extend(id + 1, BankerType::Mutex);
-        id as isize
+        id
     } else {
         process_inner.mutex_list.push(mutex);
-        process_inner.available_list.push(1);
-        assert_eq!(
-            process_inner.mutex_list.len(),
-            process_inner.available_list.len()
-        );
-        let id = process_inner.mutex_list.len() - 1;
-        process_inner.thread_deadlock_list_extend(id + 1, BankerType::Mutex);
-        id as isize
-    }
+        process_inner.mutex_list.len() - 1
+    };
+    process_inner.mutex_banker.add_resource(res_id, 1);
+    res_id as isize
 }
 /// mutex lock syscall
 pub fn sys_mutex_lock(mutex_id: usize) -> isize {
@@ -81,6 +70,8 @@ pub fn sys_mutex_lock(mutex_id: usize) -> isize {
             .unwrap()
             .tid
     );
+    let process = current_process();
+    let mut process_inner = process.inner_exclusive_access();
     let tid = current_task()
         .unwrap()
         .inner_exclusive_access()
@@ -88,25 +79,16 @@ pub fn sys_mutex_lock(mutex_id: usize) -> isize {
         .as_ref()
         .unwrap()
         .tid;
-    let process = current_process();
-    let mut process_inner = process.inner_exclusive_access();
-    if !process_inner.alloc_res(tid, mutex_id, 1, BankerType::Mutex) {
-        trace!(
-            "kernel:pid[{}] tid[{}] sys_mutex_lock failed!!",
-            process.getpid(),
-            tid,
-        );
+    if !process_inner.mutex_banker.can_alloc(tid, mutex_id, 1) {
         return -0xDEAD;
     }
-    trace!(
-        "kernel:pid[{}] tid[{}] sys_mutex_lock secceed!!",
-        process.getpid(),
-        tid,
-    );
     let mutex = Arc::clone(process_inner.mutex_list[mutex_id].as_ref().unwrap());
     drop(process_inner);
     drop(process);
     mutex.lock();
+    let process = current_process();
+    let mut process_inner = process.inner_exclusive_access();
+    process_inner.mutex_banker.alloc(tid, mutex_id, 1);
     0
 }
 /// mutex unlock syscall
@@ -122,6 +104,8 @@ pub fn sys_mutex_unlock(mutex_id: usize) -> isize {
             .unwrap()
             .tid
     );
+    let process = current_process();
+    let mut process_inner = process.inner_exclusive_access();
     let tid = current_task()
         .unwrap()
         .inner_exclusive_access()
@@ -129,9 +113,7 @@ pub fn sys_mutex_unlock(mutex_id: usize) -> isize {
         .as_ref()
         .unwrap()
         .tid;
-    let process = current_process();
-    let mut process_inner = process.inner_exclusive_access();
-    process_inner.dealloc_res(tid, mutex_id, BankerType::Mutex);
+    process_inner.mutex_banker.dealloc(tid, mutex_id, 1);
     let mutex = Arc::clone(process_inner.mutex_list[mutex_id].as_ref().unwrap());
     drop(process_inner);
     drop(process);
@@ -161,24 +143,14 @@ pub fn sys_semaphore_create(res_count: usize) -> isize {
         .map(|(id, _)| id)
     {
         process_inner.semaphore_list[id] = Some(Arc::new(Semaphore::new(res_count)));
-        process_inner.available_list[id] = res_count;
-        assert_eq!(
-            process_inner.semaphore_list.len(),
-            process_inner.available_list.len()
-        );
         id
     } else {
         process_inner
             .semaphore_list
             .push(Some(Arc::new(Semaphore::new(res_count))));
-        process_inner.available_list.push(res_count);
-        assert_eq!(
-            process_inner.semaphore_list.len(),
-            process_inner.available_list.len()
-        );
         process_inner.semaphore_list.len() - 1
     };
-    process_inner.thread_deadlock_list_extend(id + 1, BankerType::Sem);
+    process_inner.semaphore_banker.add_resource(id, res_count);
     id as isize
 }
 /// semaphore up syscall
@@ -195,6 +167,8 @@ pub fn sys_semaphore_up(sem_id: usize) -> isize {
             .tid,
         sem_id,
     );
+    let process = current_process();
+    let mut process_inner = process.inner_exclusive_access();
     let tid = current_task()
         .unwrap()
         .inner_exclusive_access()
@@ -202,9 +176,7 @@ pub fn sys_semaphore_up(sem_id: usize) -> isize {
         .as_ref()
         .unwrap()
         .tid;
-    let process = current_process();
-    let mut process_inner = process.inner_exclusive_access();
-    process_inner.dealloc_res(tid, sem_id, BankerType::Sem);
+    process_inner.semaphore_banker.dealloc(tid, sem_id, 1);
     let sem = Arc::clone(process_inner.semaphore_list[sem_id].as_ref().unwrap());
     drop(process_inner);
     sem.up();
@@ -223,6 +195,8 @@ pub fn sys_semaphore_down(sem_id: usize) -> isize {
     //         .unwrap()
     //         .tid
     // );
+    let process = current_process();
+    let mut process_inner = process.inner_exclusive_access();
     let tid = current_task()
         .unwrap()
         .inner_exclusive_access()
@@ -230,26 +204,15 @@ pub fn sys_semaphore_down(sem_id: usize) -> isize {
         .as_ref()
         .unwrap()
         .tid;
-    let process = current_process();
-    let mut process_inner = process.inner_exclusive_access();
-    if !process_inner.alloc_res(tid, sem_id, 1, BankerType::Sem) {
-        trace!(
-            "kernel:pid[{}] tid[{}] sem_id[{}], sys_semaphore_down failed!!",
-            process.getpid(),
-            tid,
-            sem_id,
-        );
+    if !process_inner.semaphore_banker.can_alloc(tid, sem_id, 1) {
         return -0xDEAD;
     }
-    trace!(
-        "kernel:pid[{}] tid[{}] sem_id[{}], sys_semaphore_down succeed!!",
-        process.getpid(),
-        tid,
-        sem_id,
-    );
     let sem = Arc::clone(process_inner.semaphore_list[sem_id].as_ref().unwrap());
     drop(process_inner);
     sem.down();
+    let process = current_process();
+    let mut process_inner = process.inner_exclusive_access();
+    process_inner.semaphore_banker.alloc(tid, sem_id, 1);
     0
 }
 /// condvar create syscall
@@ -329,13 +292,13 @@ pub fn sys_condvar_wait(condvar_id: usize, mutex_id: usize) -> isize {
 ///
 /// YOUR JOB: Implement deadlock detection, but might not all in this syscall
 pub fn sys_enable_deadlock_detect(_enabled: usize) -> isize {
-    trace!("kernel: sys_enable_deadlock_detect ");
-    if _enabled == 1 || _enabled == 0 {
-        current_process()
-            .inner_exclusive_access()
-            .set_deadlock_detect(_enabled == 1);
-        0
-    } else {
-        -1
+    trace!("kernel: sys_enable_deadlock_detect");
+    let process = current_process();
+    let mut process_inner = process.inner_exclusive_access();
+    if _enabled != 1 && _enabled != 0 {
+        return -1;
     }
+    process_inner.mutex_banker.set_valid(_enabled == 1);
+    process_inner.semaphore_banker.set_valid(_enabled == 1);
+    0
 }

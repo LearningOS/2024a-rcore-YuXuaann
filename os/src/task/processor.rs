@@ -96,8 +96,7 @@ pub fn current_user_token() -> usize {
     task.get_user_token()
 }
 
-/// Write to the current user addr space
-/// no bug
+/// Write to current user buffer
 pub fn write_to_current_user_buffer<T, F>(addr: T, data: F, len: usize) -> isize
 where
     T: Into<*const u8>,
